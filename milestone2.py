@@ -1,31 +1,30 @@
 # milestone2.py
 """
-Smart Bank Assistant - milestone2.py
-Final improved version (full file).
-- Uses ML intent prediction if available.
-- Hybrid rules + dataset-driven responses.
-- Session-based context/slot tracking.
-- Strict DB account validation (account_no column).
-- Session login: asks account number once and remembers it.
-- Transfer flow with detailed receipt.
-- Card services flow improved: after user selects a card menu option (1-4),
-  the bot asks "Credit Card or Debit Card?" and uses the answer together with
-  the selected option to produce the result.
-- Loan services, greeting recognition, exit commands, change account, escalation.
-- Uses dataset CSV for responses and fallback (bankbot_final_expanded1.csv).
-- Responds with trailing tag: [ intent: xxx ]
-- Keep personalization OFF by default.
+Smart Bank Assistant - milestone2.py (UPDATED)
+- Uses bank_db.py as single source of truth for DB operations.
+- Provides generate_bot_response(msg) for Flask (app.py) integration.
+- Keeps original flows: login, balance inquiry, fund transfer, loan & card menus, etc.
 """
 
 import os
 import re
 import sys
 import random
-import sqlite3
 import joblib
 import pandas as pd
 import difflib
 from datetime import datetime
+
+# --- Use bank_db for all DB interactions ---
+from bank_db import (
+    create_db,
+    get_user_by_account,
+    update_balance as db_update_balance,
+    transfer_funds as db_transfer_funds,
+    record_transaction as db_record_transaction,
+    verify_user_login as db_verify_user_login,
+    get_balance as db_get_balance,
+)
 
 # --------------------------
 # CONFIGURATION
@@ -51,112 +50,60 @@ MIN_AGE_LOAN = 21
 MIN_MONTHLY_SALARY_FOR_LOAN = 10000.0   # example threshold
 MIN_MONTHLY_SALARY_FOR_CARD = 10000.0   # example threshold
 
-import sqlite3
-from datetime import datetime
+# --------------------------
+# DB / UTILITY LAYER (wrappers over bank_db.py)
+# --------------------------
 
-DB_PATH = "bank.db"
-
-# -------------------------- DB / UTILITY LAYER --------------------------
-
-def ensure_db_schema(db_path="bank.db"):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-
-    # Create table only if it does not exist; do NOT drop existing data
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_number TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        phone TEXT,
-        balance REAL DEFAULT 0
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-
-def account_exists(account_number, db_path=DB_PATH):
-    """Check if a user exists in 'users' table by account_number."""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE account_number = ?", (account_number,))
-    exists = c.fetchone() is not None
-    conn.close()
-    return exists
-
-
-def get_account(account_number, db_path=DB_PATH):
-    """Return account info from 'users' table."""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("SELECT account_number, name, balance, email, phone FROM users WHERE account_number = ?", (account_number,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "account_number": row[0],
-            "name": row[1],
-            "balance": row[2],
-            "email": row[3],
-            "phone": row[4]
-        }
-    return None
-
-
-def update_balance(account_number, new_balance, db_path=DB_PATH):
-    """Update balance in 'users' table."""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("UPDATE users SET balance = ? WHERE account_number = ?", (new_balance, account_number))
-    conn.commit()
-    conn.close()
-
-
-def record_transaction(from_acc, to_acc, amount, remark="", db_path=DB_PATH):
-    """Record a transaction row in 'transactions' table."""
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    ts = datetime.utcnow().isoformat()
-    c.execute(
-        "INSERT INTO transactions (from_account, to_account, amount, timestamp, remark) VALUES (?, ?, ?, ?, ?)",
-        (from_acc, to_acc, amount, ts, remark)
-    )
-    txn_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return txn_id, ts
-
-# ----------------------- LOGIN FUNCTION -----------------------
-
-def verify_user_login(email, password, db_path=DB_PATH):
+def ensure_db_schema():
     """
-    Verify login by email and password using 'users' table.
-    Returns dict if successful, None otherwise.
+    Ensure DB schema exists by calling bank_db.create_db()
     """
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("""
-        SELECT account_number, name, email, phone, balance
-        FROM users
-        WHERE email = ? AND password = ?
-    """, (email, password))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "account_number": row[0],
-            "name": row[1],
-            "email": row[2],
-            "phone": row[3],
-            "balance": row[4]
-        }
-    return None
+    create_db()
 
+
+def account_exists(account_number):
+    """Check if account exists by querying bank_db.get_user_by_account"""
+    if not account_number:
+        return False
+    row = get_user_by_account(account_number)
+    return row is not None
+
+
+def get_account(account_number):
+    """Return account info as a dict, or None."""
+    row = get_user_by_account(account_number)
+    if not row:
+        return None
+    # bank_db returns sqlite3.Row, support both dict and Row access
+    return {
+        "account_number": row["account_number"],
+        "name": row["name"],
+        "balance": float(row["balance"]) if row["balance"] is not None else 0.0,
+        "email": row.get("email") if isinstance(row, dict) else row["email"],
+        "phone": row.get("phone") if isinstance(row, dict) else row["phone"],
+    }
+
+
+def update_balance(account_number, new_balance):
+    """Wrapper to bank_db.update_balance"""
+    db_update_balance(account_number, new_balance)
+
+
+def record_transaction(from_acc, to_acc, amount, remark="", mode="online", status="success"):
+    """
+    Wrap bank_db.record_transaction. bank_db.record_transaction signature:
+        record_transaction(sender, receiver, receiver_name, amount, mode, status)
+    We may not have receiver_name here; attempt to fetch it.
+    """
+    receiver_name = None
+    rec = get_user_by_account(to_acc)
+    if rec:
+        receiver_name = rec["name"]
+    try:
+        db_record_transaction(from_acc, to_acc, receiver_name or "", amount, mode, status)
+    except Exception:
+        # best-effort: ignore DB fail here (app should log real errors)
+        pass
 
 # --------------------------
 # NLU / Dataset Loading
@@ -261,31 +208,31 @@ def extract_age_and_income(text):
     """
     if not text:
         return None, None
-    text = text.lower()
+    text_l = text.lower()
     age = None
     income = None
 
-    m_age = re.search(r'age[:\s]*([0-9]{1,3})', text)
+    m_age = re.search(r'age[:\s]*([0-9]{1,3})', text_l)
     if m_age:
         try:
             age = int(m_age.group(1))
         except:
             age = None
 
-    m_inc = re.search(r'(income|salary|monthly income|annual income)[:\s]*([0-9,.\s]+)', text)
+    m_inc = re.search(r'(income|salary|monthly income|annual income)[:\s]*([0-9,.\s]+)', text_l)
     if m_inc:
         num = try_parse_number(m_inc.group(2))
         if num is not None:
             income = float(num)
 
     if age is None:
-        nums = re.findall(r'\d{1,7}', text)
+        nums = re.findall(r'\d{1,7}', text_l)
         if len(nums) >= 1:
             first = int(nums[0])
             if 10 <= first <= 120:
                 age = first
     if income is None:
-        nums = re.findall(r'\d{3,15}', text)
+        nums = re.findall(r'\d{3,15}', text_l)
         if nums:
             try:
                 income_candidates = [float(n) for n in nums]
@@ -373,11 +320,16 @@ class Session:
         self.logged_in = False
 
 
-def ask_for_account(session, dataset_map):
+def ask_for_account(session, dataset_map, interactive=True):
     """
-    Ask and validate account number. Repeat until valid input or user exits.
+    Ask and validate account number.
+    If interactive=True, asks via input() (used in CLI mode).
     Returns True if logged in successfully, False if user chose to exit.
     """
+    # If called non-interactively, return False (app.py will call login separately)
+    if not interactive:
+        return False
+
     while True:
         sys.stdout.write("Bot: Please enter your account number: ")
         sys.stdout.flush()
@@ -423,14 +375,19 @@ def handle_balance_inquiry(intent, confidence, dataset_map, session):
     return resp, "balance_inquiry"
 
 
-def handle_fund_transfer(intent, confidence, dataset_map, session, text):
+def handle_fund_transfer(intent, confidence, dataset_map, session, text, interactive=True):
     """
     Fund transfer flow.
+    If interactive=True, will prompt via input() for missing fields.
+    When used by Flask (interactive=False) the calling layer must supply receiver & amount in text.
     """
     if not session.logged_in:
-        got = ask_for_account(session, dataset_map)
-        if not got:
-            return None, "exit"
+        if interactive:
+            got = ask_for_account(session, dataset_map)
+            if not got:
+                return None, "exit"
+        else:
+            return "Please login first.", "not_logged_in"
 
     sender_acc = get_account(session.account_number)
     if not sender_acc:
@@ -439,92 +396,93 @@ def handle_fund_transfer(intent, confidence, dataset_map, session, text):
 
     amount = None
     receiver = None
-    amount_search = re.search(r'₹?\s*([0-9]+(?:\.[0-9]{1,2})?)', text.replace(',', ''))
-    if amount_search:
-        try:
-            amount = float(amount_search.group(1))
-        except:
-            amount = None
+    # Try to extract amount and receiver from text
+    if text:
+        amount_search = re.search(r'₹?\s*([0-9]+(?:\.[0-9]{1,2})?)', text.replace(',', ''))
+        if amount_search:
+            try:
+                amount = float(amount_search.group(1))
+            except:
+                amount = None
 
-    acc_search = re.search(r'\b(\d{6,16})\b', text)
-    if acc_search:
-        receiver = acc_search.group(1)
+        acc_search = re.search(r'\b(\d{6,16})\b', text)
+        if acc_search:
+            receiver = acc_search.group(1)
 
-    while not receiver:
-        sys.stdout.write("Bot: Please provide receiver account number (or type 'cancel' to abort): ")
-        sys.stdout.flush()
-        u = input().strip()
-        if not u:
-            continue
-        if u.lower() in EXIT_COMMANDS or u.lower() == "cancel":
-            return "Transfer cancelled.", "transfer_cancelled"
-        if account_exists(u):
-            receiver = u
-            break
-        else:
-            sys.stdout.write("Bot: I couldn't find that receiver in our bank. Do you want to proceed to an external recipient? (yes/no): ")
+    # If interactive CLI, ask for missing receiver/amount
+    if interactive:
+        while not receiver:
+            sys.stdout.write("Bot: Please provide receiver account number (or type 'cancel' to abort): ")
             sys.stdout.flush()
-            ack = input().strip().lower()
-            if ack in ("yes", "y"):
+            u = input().strip()
+            if not u:
+                continue
+            if u.lower() in EXIT_COMMANDS or u.lower() == "cancel":
+                return "Transfer cancelled.", "transfer_cancelled"
+            if account_exists(u):
                 receiver = u
                 break
             else:
-                continue
+                sys.stdout.write("Bot: I couldn't find that receiver in our bank. Do you want to proceed to an external recipient? (yes/no): ")
+                sys.stdout.flush()
+                ack = input().strip().lower()
+                if ack in ("yes", "y"):
+                    receiver = u
+                    break
+                else:
+                    continue
 
-    while amount is None:
-        sys.stdout.write("Bot: Enter amount to transfer (numbers only): ")
-        sys.stdout.flush()
-        u = input().strip()
-        if not u:
-            continue
-        if u.lower() in EXIT_COMMANDS or u.lower() == "cancel":
-            return "Transfer cancelled.", "transfer_cancelled"
-        try:
-            amount = float(u.replace(',', '').replace('₹', '').strip())
-            if amount <= 0:
-                print("Bot: Amount must be greater than 0.")
+        while amount is None:
+            sys.stdout.write("Bot: Enter amount to transfer (numbers only): ")
+            sys.stdout.flush()
+            u = input().strip()
+            if not u:
+                continue
+            if u.lower() in EXIT_COMMANDS or u.lower() == "cancel":
+                return "Transfer cancelled.", "transfer_cancelled"
+            try:
+                amount = float(u.replace(',', '').replace('₹', '').strip())
+                if amount <= 0:
+                    print("Bot: Amount must be greater than 0.")
+                    amount = None
+                    continue
+            except:
+                print("Bot: Couldn't parse the amount. Try again.")
                 amount = None
                 continue
-        except:
-            print("Bot: Couldn't parse the amount. Try again.")
-            amount = None
-            continue
+    else:
+        # Non-interactive (e.g., called from app.py). If missing data, return guided message.
+        if not receiver or amount is None:
+            return "Please provide receiver account number and amount (e.g., 'transfer 5000 to 12345678').", "insufficient_parameters"
 
+    # Check funds using bank_db.get_user_by_account
     if sender_acc["balance"] < amount:
         resp = sample_dataset_response("insufficient_funds", dataset_map) or "Insufficient balance for this transfer."
         return resp, "insufficient_funds"
 
-    receiver_name = None
-    if account_exists(receiver):
-        rec_acc = get_account(receiver)
-        receiver_name = rec_acc.get("name")
-    confirm_msg = f"You're about to transfer ₹{amount:.2f} from {sender_acc['account_number']} to {receiver}"
-    if receiver_name:
-        confirm_msg += f" ({receiver_name})"
-    confirm_msg += ". Confirm? (yes/no): "
-    sys.stdout.write("Bot: " + confirm_msg)
-    sys.stdout.flush()
-    ack = input().strip().lower()
-    if ack not in ("yes", "y"):
-        return "Transfer cancelled.", "transfer_cancelled"
+    # Attempt transfer via bank_db.transfer_funds
+    success, msg = db_transfer_funds(sender_acc["account_number"], receiver, amount)
+    # record transaction in both cases
+    try:
+        rec = get_user_by_account(receiver)
+        receiver_name = rec["name"] if rec else ""
+    except:
+        receiver_name = ""
+    db_record_transaction(sender_acc["account_number"], receiver, receiver_name, amount, "online", "success" if success else "failed")
 
-    new_sender_balance = sender_acc["balance"] - amount
-    update_balance(sender_acc["account_number"], new_sender_balance)
+    if not success:
+        return msg, "transfer_failed"
 
-    if account_exists(receiver):
-        rec_acc = get_account(receiver)
-        new_receiver_balance = rec_acc["balance"] + amount
-        update_balance(receiver, new_receiver_balance)
-    txn_id, ts = record_transaction(sender_acc["account_number"], receiver, amount, remark="fund_transfer")
-
+    # Provide receipt
+    ts = datetime.utcnow().isoformat()
     receipt_lines = [
         "Transfer Successful!",
-        f"Transaction ID: {txn_id}",
+        f"Transaction: {msg}",
         f"Timestamp (UTC): {ts}",
         f"From: {sender_acc['account_number']} ({sender_acc.get('name') or 'N/A'})",
         f"To: {receiver} {f'({receiver_name})' if receiver_name else ''}",
         f"Amount: ₹{amount:.2f}",
-        f"Remaining Balance: ₹{new_sender_balance:.2f}",
+        f"Remaining Balance: ₹{(db_get_balance(sender_acc['account_number'])):.2f}",
         "If you need a copy of this receipt, say 'email receipt' or 'save receipt'."
     ]
     receipt = "\n".join(receipt_lines)
@@ -534,7 +492,6 @@ def handle_fund_transfer(intent, confidence, dataset_map, session, text):
 # --------------------------
 # Loan & Card Menus + Handlers
 # --------------------------
-
 
 def build_loan_menu(dataset_map):
     menu = sample_dataset_response("loan_services_menu", dataset_map)
@@ -610,10 +567,7 @@ def build_card_menu(dataset_map):
             "Type the option number or ask, e.g. 'block my card'.")
 
 
-# -- Separate card helper functions (exist in your original code structure) --
-
 def card_eligibility_short(card_type, dataset_map):
-    # Short Option A style response
     ct = "Credit Card" if "credit" in card_type.lower() else "Debit Card"
     resp = sample_dataset_response("card_eligibility", dataset_map) or ""
     short = f"{ct} Eligibility:\n✔ Minimum Age: 21\n✔ Income Proof Required\n✔ Status: Eligible"
@@ -650,15 +604,9 @@ def card_apply_flow(card_type, dataset_map):
 
 
 def handle_card_selection(selection, dataset_map, session):
-    """
-    Modified: This function records the selected option in session.slots
-    and returns a prompt asking for card type (credit/debit).
-    """
     sel = selection.strip().lower()
-    # Map common synonyms to the numbered option
     if sel in ("1", "eligibility", "check card eligibility", "card eligibility"):
         session.slots['card_pending_option'] = "1"
-        # Ask for type next
         return "Which card type: Credit Card or Debit Card? (reply 'credit' or 'debit')", "card_type"
     if sel in ("2", "limit", "card limit", "card limit enquiry"):
         session.slots['card_pending_option'] = "2"
@@ -670,7 +618,6 @@ def handle_card_selection(selection, dataset_map, session):
         session.slots['card_pending_option'] = "4"
         return "Which card type: Credit Card or Debit Card? (reply 'credit' or 'debit')", "card_type"
 
-    # If user wrote "credit card" or "debit card" directly while in selection
     if "credit" in sel or "debit" in sel:
         return "Please choose an option number from the card menu (1-4) and then specify credit or debit when prompted.", "card_selection"
 
@@ -679,43 +626,33 @@ def handle_card_selection(selection, dataset_map, session):
 
 
 def perform_card_action_based_on_type(card_type, dataset_map, session):
-    """
-    After user replies credit/debit, this function reads session.slots['card_pending_option']
-    and returns the short professional message (Option A style) tailored by card_type.
-    It also clears the card_pending_option slot.
-    """
     opt = session.slots.get('card_pending_option')
     session.slots.pop('card_pending_option', None)
     ct = "Credit Card" if 'credit' in card_type.lower() else "Debit Card"
 
     if opt == "1":
-        # Check Card Eligibility
         return card_eligibility_short(card_type, dataset_map)
 
     if opt == "2":
-        # Card Limit Enquiry
         return card_limit_enquiry(card_type, dataset_map)
 
     if opt == "3":
-        # Block Lost/Stolen Card
         return card_block_action(card_type, dataset_map)
 
     if opt == "4":
-        # Apply for New Card
         return card_apply_flow(card_type, dataset_map)
 
-    # fallback
     return "Okay. How can I help further with cards?"
 
 
 # --------------------------
-# OTHER HANDLERS (unchanged)
+# OTHER HANDLERS
 # --------------------------
 
 
 def handle_change_account(session, dataset_map):
     session.logout()
-    print("Bot: Okay, let's change account.")
+    # In interactive CLI mode, ask for account
     success = ask_for_account(session, dataset_map)
     if not success:
         return None, "exit"
@@ -779,22 +716,17 @@ class BankAssistant:
         if self.session.slots.get("awaiting") == "card_selection":
             sel = text
             reply, next_state = handle_card_selection(sel, self.dataset_map, self.session)
-            # handle_card_selection now sets session.slots['card_pending_option'] and returns next_state 'card_type'
             self.session.slots.pop("awaiting", None)
             if next_state:
-                # next_state will be 'card_type' when asking card type
                 self.session.slots["awaiting"] = next_state
             return f"{reply} [ intent: card_services ]", False
 
         # If awaiting card type (credit/debit) after selecting option
         if self.session.slots.get("awaiting") == "card_type":
-            # interpret reply as card type
             card_type_text = text.lower()
             if not any(k in card_type_text for k in ("credit", "debit")):
                 return f"Please reply with 'credit' or 'debit' to proceed. [ intent: card_services ]", False
-            # perform action using pending option
             reply = perform_card_action_based_on_type(card_type_text, self.dataset_map, self.session)
-            # clear the awaiting state
             self.session.slots.pop("awaiting", None)
             return f"{reply} [ intent: card_services ]", False
 
@@ -826,7 +758,7 @@ class BankAssistant:
             reply = "\n".join(reply_lines)
             return f"{reply} [ intent: loan_eligibility ]", False
 
-        # If awaiting numeric input for card (this is separate from card_type flow)
+        # If awaiting numeric input for card
         if self.session.slots.get("awaiting") == "card_numeric":
             digits = re.sub(r'\D', '', text)
             age, income = extract_age_and_income(text)
@@ -880,14 +812,14 @@ class BankAssistant:
 
         # Predict intent using model (on corrected text)
         intent, confidence = predict_intent(self.model, text)
-        
+
         # Prevent misclassification of loan -> loan_payment when just 'loan'
         payment_keywords = {"paid", "payment", "pay", "paid-off", "installment", "emi", "paid"}
         if intent and "loan" in intent and "payment" in intent:
             if "loan" in lowered and not any(pk in lowered for pk in payment_keywords):
                 intent = "loan_services"
                 confidence = 0.9
-        
+
         # Low confidence rescue logic
         if confidence < CONFIDENCE_THRESHOLD:
             if GREETINGS_REGEX.search(text):
@@ -911,7 +843,7 @@ class BankAssistant:
                 return f"{resp} [ intent: {lbl} ]", False
 
             if "transfer" in lowered or "send money" in lowered:
-                resp, lbl = handle_fund_transfer("fund_transfer", confidence, self.dataset_map, self.session, text)
+                resp, lbl = handle_fund_transfer("fund_transfer", confidence, self.dataset_map, self.session, text, interactive=False)
                 return f"{resp} [ intent: {lbl} ]", False
 
             resp, intent_label = handle_fallback(intent, confidence, self.dataset_map, self.session, text)
@@ -923,7 +855,7 @@ class BankAssistant:
             return f"{resp} [ intent: {label} ]", False
 
         if intent in ("fund_transfer", "transfer", "send_money"):
-            resp, label = handle_fund_transfer(intent, confidence, self.dataset_map, self.session, text)
+            resp, label = handle_fund_transfer(intent, confidence, self.dataset_map, self.session, text, interactive=False)
             return f"{resp} [ intent: {label} ]", False
 
         if intent in ("loan_services", "loan", "loan_info", "loan_details"):
@@ -962,9 +894,8 @@ class BankAssistant:
 
 
 # --------------------------
-# START / CHAT LOOP
+# START / CHAT LOOP (CLI)
 # --------------------------
-
 
 def start_chat():
     print("Starting Smart Bank Assistant (milestone2)...")
@@ -1006,6 +937,54 @@ def start_chat():
             break
 
 
+# --------------------------
+# Flask-compatible adapter
+# --------------------------
+
+# single shared assistant instance for the Flask app to reuse
+_assistant_singleton = None
+
+def generate_bot_response(user_message):
+    """
+    Flask / app.py expects: intent, entities, reply, confidence = bot.generate_bot_response(msg)
+    We'll return:
+        intent (str), entities (dict), reply (str), confidence (float)
+    """
+    global _assistant_singleton
+    if _assistant_singleton is None:
+        ensure_db_schema()
+        model = load_intent_model()
+        dataset_map = load_dataset_responses()
+        _assistant_singleton = BankAssistant(model=model, dataset_map=dataset_map)
+
+    assistant = _assistant_singleton
+
+    # process the message
+    reply, should_exit = assistant.process(user_message or "")
+
+    # Try extracting intent tag from reply: format ends with "[ intent: xyz ]"
+    intent = "unknown"
+    confidence = 0.0
+    entities = {}
+
+    m = re.search(r'\[ intent:\s*([^\]]+)\]', reply)
+    if m:
+        intent = m.group(1).strip()
+
+    # If the model exists, try to predict a confidence value
+    try:
+        if assistant.model:
+            pred_intent, conf = predict_intent(assistant.model, user_message or "")
+            confidence = float(conf)
+            # Prefer NLU's intent only if it matches the tag or tag is unknown
+            if intent == "unknown":
+                intent = pred_intent
+    except Exception:
+        confidence = 0.0
+
+    return intent, entities, reply, confidence
+
+
+# Allow running as CLI tool
 if __name__ == "__main__":
-    # Launch the interactive chat loop
     start_chat()
